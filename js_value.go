@@ -185,7 +185,7 @@ func (v *Value) GoValue() interface{} {
 	} else if v.IsString() {
 		ret = v.String()
 	} else if v.IsObject() {
-		ret = v.ToObject().GoValue
+		ret = v.ToObject().GoValue()
 	} else if v.IsArray() {
 		arr := v.ToArray()
 		goArr := make([]interface{}, arr.GetLength())
@@ -201,7 +201,7 @@ func (v *Value) GoValue() interface{} {
 }
 
 // Call a function value
-func (v *Value) Call(argv []*Value) *Value {
+func (v *Value) Call(argv ...*Value) *Value {
 	v.cx.rt.lock()
 	defer v.cx.rt.unlock()
 
