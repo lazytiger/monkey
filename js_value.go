@@ -22,7 +22,7 @@ func newValue(cx *Context, val C.jsval) *Value {
 	C.JS_AddValueRoot(cx.jscx, &result.val)
 
 	runtime.SetFinalizer(result, func(v *Value) {
-		C.JS_RemoveValueRoot(v.cx.jscx, &v.val)
+		cx.rt.valDisposeChan <- v
 	})
 
 	return result
@@ -41,10 +41,11 @@ func (v *Value) String() string {
 }
 
 func (v *Value) TypeName() string {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
-
-	return C.GoString(C.JS_GetTypeName(v.cx.jscx, C.JS_TypeOfValue(v.cx.jscx, v.val)))
+	var result string
+	v.cx.rt.Use(func() {
+		result = C.GoString(C.JS_GetTypeName(v.cx.jscx, C.JS_TypeOfValue(v.cx.jscx, v.val)))
+	})
+	return result
 }
 
 func (v *Value) IsNull() bool {
@@ -76,124 +77,144 @@ func (v *Value) IsObject() bool {
 }
 
 func (v *Value) IsArray() bool {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
-
-	return v.IsObject() && C.JS_IsArrayObject(
-		v.cx.jscx, C.JSVAL_TO_OBJECT(v.val),
-	) == C.JS_TRUE
+	var result bool
+	v.cx.rt.Use(func() {
+		result = v.IsObject() && C.JS_IsArrayObject(
+			v.cx.jscx, C.JSVAL_TO_OBJECT(v.val),
+		) == C.JS_TRUE
+	})
+	return result
 }
 
 func (v *Value) IsFunction() bool {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
-
-	return v.IsObject() && C.JS_ObjectIsFunction(
-		v.cx.jscx, C.JSVAL_TO_OBJECT(v.val),
-	) == C.JS_TRUE
+	var result bool
+	v.cx.rt.Use(func() {
+		result = v.IsObject() && C.JS_ObjectIsFunction(
+			v.cx.jscx, C.JSVAL_TO_OBJECT(v.val),
+		) == C.JS_TRUE
+	})
+	return result
 }
 
 // Convert a value to Int.
 func (v *Value) ToInt() (int32, bool) {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
+	var result1 int32
+	var result2 bool
 
-	var r C.int32
-	if C.JS_ValueToInt32(v.cx.jscx, v.val, &r) == C.JS_TRUE {
-		return int32(r), true
-	}
-	return 0, false
+	v.cx.rt.Use(func() {
+		var r C.int32
+		if C.JS_ValueToInt32(v.cx.jscx, v.val, &r) == C.JS_TRUE {
+			result1, result2 = int32(r), true
+		}
+	})
+
+	return result1, result2
 }
 
 // Convert a value to Number.
 func (v *Value) ToNumber() (float64, bool) {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
+	var result1 float64
+	var result2 bool
 
-	var r C.jsdouble
-	if C.JS_ValueToNumber(v.cx.jscx, v.val, &r) == C.JS_TRUE {
-		return float64(r), true
-	}
-	return 0, false
+	v.cx.rt.Use(func() {
+		var r C.jsdouble
+		if C.JS_ValueToNumber(v.cx.jscx, v.val, &r) == C.JS_TRUE {
+			result1, result2 = float64(r), true
+		}
+	})
+
+	return result1, result2
 }
 
 // Convert a value to Boolean.
 func (v *Value) ToBoolean() (bool, bool) {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
+	var result1 bool
+	var result2 bool
 
-	var r C.JSBool
-	if C.JS_ValueToBoolean(v.cx.jscx, v.val, &r) == C.JS_TRUE {
-		if r == C.JS_TRUE {
-			return true, true
+	v.cx.rt.Use(func() {
+		var r C.JSBool
+		if C.JS_ValueToBoolean(v.cx.jscx, v.val, &r) == C.JS_TRUE {
+			if r == C.JS_TRUE {
+				result1, result2 = true, true
+			} else {
+				result1, result2 = false, true
+			}
 		}
-		return false, true
-	}
-	return false, false
+	})
+
+	return result1, result2
 }
 
 // Convert a value to String.
 func (v *Value) ToString() string {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
+	var result string
 
-	cstring := C.JS_EncodeString(v.cx.jscx, C.JS_ValueToString(v.cx.jscx, v.val))
-	gostring := C.GoString(cstring)
-	C.JS_free(v.cx.jscx, unsafe.Pointer(cstring))
+	v.cx.rt.Use(func() {
+		cstring := C.JS_EncodeString(v.cx.jscx, C.JS_ValueToString(v.cx.jscx, v.val))
+		gostring := C.GoString(cstring)
+		C.JS_free(v.cx.jscx, unsafe.Pointer(cstring))
 
-	return gostring
+		result = gostring
+	})
+
+	return result
 }
 
 // Convert a value to Object.
 func (v *Value) ToObject() *Object {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
+	var result *Object
 
-	var obj *C.JSObject
-	if C.JS_ValueToObject(v.cx.jscx, v.val, &obj) == C.JS_TRUE {
-		return newObject(v.cx, obj, nil)
-	}
+	v.cx.rt.Use(func() {
+		var obj *C.JSObject
+		if C.JS_ValueToObject(v.cx.jscx, v.val, &obj) == C.JS_TRUE {
+			result = newObject(v.cx, obj, nil)
+		}
+	})
 
-	return nil
+	return result
 }
 
 // Convert a value to Array.
 func (v *Value) ToArray() *Array {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
+	var result *Array
 
-	var obj *C.JSObject
-	if C.JS_ValueToObject(v.cx.jscx, v.val, &obj) == C.JS_TRUE {
-		if C.JS_IsArrayObject(v.cx.jscx, obj) == C.JS_TRUE {
-			return newArray(v.cx, obj)
+	v.cx.rt.Use(func() {
+		var obj *C.JSObject
+		if C.JS_ValueToObject(v.cx.jscx, v.val, &obj) == C.JS_TRUE {
+			if C.JS_IsArrayObject(v.cx.jscx, obj) == C.JS_TRUE {
+				result = newArray(v.cx, obj)
+			}
 		}
-	}
+	})
 
-	return nil
+	return result
 }
 
-// 将一个值直接转换成go类型
-func (v *Value) GoValue() interface{} {
+// Convert a JavaScript value to Go object
+func (v *Value) ToGo() interface{} {
 	var ret interface{}
-	if v.IsBoolean() {
+
+	switch {
+	case v.IsBoolean():
 		ret, _ = v.ToBoolean()
-	} else if v.IsInt() {
+	case v.IsInt():
 		ret, _ = v.ToInt()
-	} else if v.IsNull() {
-	} else if v.IsNumber() {
+	case v.IsNumber():
 		ret, _ = v.ToNumber()
-	} else if v.IsString() {
+	case v.IsString():
 		ret = v.String()
-	} else if v.IsObject() {
-		ret = v.ToObject().GoValue()
-	} else if v.IsArray() {
+	case v.IsObject():
+		ret = v.ToObject().ToGo()
+	case v.IsArray():
 		arr := v.ToArray()
 		goArr := make([]interface{}, arr.GetLength())
 		for i := 0; i < arr.GetLength(); i++ {
-			goArr[i] = arr.GetElement(i).GoValue()
+			goArr[i] = arr.GetElement(i).ToGo()
 		}
 		ret = goArr
-	} else {
+	case v.IsNull():
+		ret = nil
+	default:
 		panic("unsupported js type")
 	}
 
@@ -205,18 +226,20 @@ func (v *Value) Call(argv ...*Value) *Value {
 	v.cx.rt.lock()
 	defer v.cx.rt.unlock()
 
-	argv2 := make([]C.jsval, len(argv))
-	for i := 0; i < len(argv); i++ {
-		argv2[i] = argv[i].val
-	}
-	argv3 := unsafe.Pointer(&argv2)
-	argv4 := (*reflect.SliceHeader)(argv3).Data
-	argv5 := (*C.jsval)(unsafe.Pointer(argv4))
+	v.cx.rt.Use(func() {
+		argv2 := make([]C.jsval, len(argv))
+		for i := 0; i < len(argv); i++ {
+			argv2[i] = argv[i].val
+		}
+		argv3 := unsafe.Pointer(&argv2)
+		argv4 := (*reflect.SliceHeader)(argv3).Data
+		argv5 := (*C.jsval)(unsafe.Pointer(argv4))
 
-	var rval C.jsval
-	if C.JS_CallFunctionValue(v.cx.jscx, nil, v.val, C.uintN(len(argv)), argv5, &rval) == C.JS_TRUE {
-		return newValue(v.cx, rval)
-	}
+		var rval C.jsval
+		if C.JS_CallFunctionValue(v.cx.jscx, nil, v.val, C.uintN(len(argv)), argv5, &rval) == C.JS_TRUE {
+			result = newValue(v.cx, rval)
+		}
+	})
 
-	return nil
+	return result
 }

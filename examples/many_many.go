@@ -3,7 +3,7 @@ package main
 import "fmt"
 import "sync"
 import "runtime"
-import js "github.com/lazytiger/monkey"
+import js "github.com/realint/monkey"
 
 func assert(c bool) bool {
 	if !c {
@@ -21,15 +21,13 @@ func main() {
 	// Create script context
 	context := runtime.NewContext()
 
-	context.DefineFunction("println",
-		func(cx *js.Context, args []*js.Value) *js.Value {
-			for i := 0; i < len(args); i++ {
-				fmt.Print(args[i])
-			}
-			fmt.Println()
-			return cx.Void()
-		},
-	)
+	context.DefineFunction("println", func(f *js.Func) {
+		for i := 0; i < f.Argc(); i++ {
+			fmt.Print(f.Argv(i))
+		}
+		fmt.Println()
+		f.Return(f.Context().Void())
+	})
 
 	wg := new(sync.WaitGroup)
 
@@ -37,7 +35,7 @@ func main() {
 	for i := 0; i < 100; i++ {
 		wg.Add(1)
 		go func() {
-			for j := 0; j < 1000; j++ {
+			for j := 0; j < 100; j++ {
 				v := context.Eval("println('Hello World!')")
 				assert(v != nil)
 			}

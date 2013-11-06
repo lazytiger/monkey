@@ -35,7 +35,7 @@ func newObject(cx *Context, obj *C.JSObject, gval interface{}) *Object {
 	C.JS_AddObjectRoot(cx.jscx, &result.obj)
 
 	runtime.SetFinalizer(result, func(o *Object) {
-		C.JS_RemoveObjectRoot(o.cx.jscx, &o.obj)
+		cx.rt.objDisposeChan <- o
 	})
 
 	// User defined property and function object use this to find callback.
@@ -52,83 +52,100 @@ func (o *Object) Context() *Context {
 	return o.cx
 }
 
-func (o *Object) GoValue() interface{} {
-	if o.gval != nil {
-		return o.gval
-	}
-
+func (o *Object) ToGo() map[string]interface{} {
 	keys := o.Keys()
 	ret := make(map[string]interface{}, len(keys))
 	for _, key := range keys {
 		value := o.GetProperty(key)
+
+		// TODO: warp
+		// ret[key] = func(argv []interface{}) {
+		//     argv => argv2
+		//     value.Call(argv2)
+		// }
 		if value.IsFunction() {
 			continue
 		}
 
-		ret[key] = value.GoValue()
+		ret[key] = value.ToGo()
 	}
 	return ret
 }
 
-func (o *Object) SetGoValue(gval interface{}) {
+func (o *Object) GetPrivate() interface{} {
+	return o.gval
+}
+
+func (o *Object) SetPrivate(gval interface{}) {
 	o.gval = gval
 }
 
 func (o *Object) ToValue() *Value {
-	return newValue(o.cx, C.OBJECT_TO_JSVAL(o.obj))
+	var result *Value
+	o.cx.rt.Use(func() {
+		result = newValue(o.cx, C.OBJECT_TO_JSVAL(o.obj))
+	})
+	return result
 }
 
 func (o *Object) GetProperty(name string) *Value {
-	o.cx.rt.lock()
-	defer o.cx.rt.unlock()
+	var result *Value
 
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
+	o.cx.rt.Use(func() {
+		cname := C.CString(name)
+		defer C.free(unsafe.Pointer(cname))
 
-	var rval C.jsval
-	if C.JS_GetProperty(o.cx.jscx, o.obj, cname, &rval) == C.JS_TRUE {
-		return newValue(o.cx, rval)
-	}
+		var rval C.jsval
+		if C.JS_GetProperty(o.cx.jscx, o.obj, cname, &rval) == C.JS_TRUE {
+			result = newValue(o.cx, rval)
+		}
+	})
 
-	return nil
+	return result
 }
 
 func (o *Object) Keys() []string {
-	context := o.Context()
-	jscx := context.jscx
+	var result []string
 
-	ids := C.JS_Enumerate(jscx, o.obj)
-	if ids == nil {
-		panic("enumerate failed")
-	}
-	defer C.JS_free(jscx, unsafe.Pointer(ids))
+	o.cx.rt.Use(func() {
+		ids := C.JS_Enumerate(o.cx.jscx, o.obj)
+		if ids == nil {
+			panic("enumerate failed")
+		}
+		defer C.JS_free(o.cx.jscx, unsafe.Pointer(ids))
 
-	keys := make([]string, ids.length)
-	head := unsafe.Pointer(&ids.vector[0])
+		keys := make([]string, ids.length)
+		head := unsafe.Pointer(&ids.vector[0])
 
-	sl := &reflect.SliceHeader{
-		uintptr(unsafe.Pointer(head)), len(keys), len(keys),
-	}
-	vector := *(*[]C.jsid)(unsafe.Pointer(sl))
-	for i := 0; i < len(keys); i++ {
-		id := vector[i]
-		ckey := C.JS_EncodeString(jscx, C.JSID_TO_STRING(id))
-		gkey := C.GoString(ckey)
-		C.JS_free(jscx, unsafe.Pointer(ckey))
-		keys[i] = gkey
-	}
+		sl := &reflect.SliceHeader{
+			uintptr(head), len(keys), len(keys),
+		}
+		vector := *(*[]C.jsid)(unsafe.Pointer(sl))
+		for i := 0; i < len(keys); i++ {
+			id := vector[i]
+			ckey := C.JS_EncodeString(o.cx.jscx, C.JSID_TO_STRING(id))
+			gkey := C.GoString(ckey)
+			C.JS_free(o.cx.jscx, unsafe.Pointer(ckey))
+			keys[i] = gkey
+		}
 
-	return keys
+		result = keys
+	})
+
+	return result
 }
 
 func (o *Object) SetProperty(name string, v *Value) bool {
-	o.cx.rt.lock()
-	defer o.cx.rt.unlock()
+	var result bool
 
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
+	o.cx.rt.Use(func() {
+		cname := C.CString(name)
+		defer C.free(unsafe.Pointer(cname))
 
-	return C.JS_SetProperty(o.cx.jscx, o.obj, cname, &v.val) == C.JS_TRUE
+		result = C.JS_SetProperty(o.cx.jscx, o.obj, cname, &v.val) == C.JS_TRUE
+	})
+
+	return result
 }
 
 type JsPropertyAttrs uint
@@ -140,15 +157,62 @@ const (
 	JSPROP_PERMANENT = C.JSPROP_PERMANENT // The property cannot be deleted.
 )
 
-type JsPropertyGetter func(o *Object, name string) *Value
-type JsPropertySetter func(o *Object, name string, v *Value)
+// Go defined property getter info
+type Getter struct {
+	object *Object
+	name   string
+	result *Value
+}
+
+func (g *Getter) Object() *Object {
+	return g.object
+}
+
+func (g *Getter) Name() string {
+	return g.name
+}
+
+func (g *Getter) Return(v *Value) {
+	g.result = v
+}
+
+// Go defined property setter info
+type Setter struct {
+	object *Object
+	name   string
+	value  *Value
+}
+
+func (s *Setter) Object() *Object {
+	return s.object
+}
+
+func (s *Setter) Name() string {
+	return s.name
+}
+
+func (s *Setter) Value() *Value {
+	return s.value
+}
+
+// Go defined property getter
+type JsPropertyGetter func(g *Getter)
+
+// Go defined property setter
+type JsPropertySetter func(s *Setter)
 
 //export call_go_getter
 func call_go_getter(obj unsafe.Pointer, name *C.char, val *C.jsval) C.JSBool {
 	o := (*Object)(obj)
 	if o.getters != nil {
-		if v := o.getters[C.GoString(name)](o, C.GoString(name)); v != nil {
-			*val = v.val
+		gname := C.GoString(name)
+		getter := Getter{
+			object: o,
+			name:   gname,
+		}
+		o.getters[gname](&getter)
+		if getter.result != nil {
+			*val = getter.result.val
 			return C.JS_TRUE
 		}
 	}
@@ -159,54 +223,61 @@ func call_go_getter(obj unsafe.Pointer, name *C.char, val *C.jsval) C.JSBool {
 func call_go_setter(obj unsafe.Pointer, name *C.char, val *C.jsval) C.JSBool {
 	o := (*Object)(obj)
 	if o.setters != nil {
-		o.setters[C.GoString(name)](o, C.GoString(name), newValue(o.cx, *val))
+		gname := C.GoString(name)
+		setter := Setter{
+			object: o,
+			name:   gname,
+			value:  newValue(o.cx, *val),
+		}
+		o.setters[gname](&setter)
 		return C.JS_TRUE
 	}
 	return C.JS_FALSE
 }
 
 func (o *Object) DefineProperty(name string, value *Value, getter JsPropertyGetter, setter JsPropertySetter, attrs JsPropertyAttrs) bool {
-	o.cx.rt.lock()
-	defer o.cx.rt.unlock()
+	var result bool
 
-	if C.JS_IsArrayObject(o.cx.jscx, o.obj) == C.JS_TRUE {
-		panic("Could't define property on array.")
-	}
-
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
-
-	var r C.JSBool
-
-	if getter != nil && setter != nil {
-		r = C.JS_DefineProperty(o.cx.jscx, o.obj, cname, value.val, C.the_go_getter_callback, C.the_go_setter_callback, C.uintN(uint(attrs))|C.JSPROP_SHARED)
-	} else if getter != nil && setter == nil {
-		r = C.JS_DefineProperty(o.cx.jscx, o.obj, cname, value.val, C.the_go_getter_callback, nil, C.uintN(uint(attrs)))
-	} else if getter == nil && setter != nil {
-		r = C.JS_DefineProperty(o.cx.jscx, o.obj, cname, value.val, nil, C.the_go_setter_callback, C.uintN(uint(attrs)))
-	} else {
-		panic("The getter and setter both nil")
-	}
-
-	if r == C.JS_TRUE {
-		if getter != nil {
-			if o.getters == nil {
-				o.getters = make(map[string]JsPropertyGetter)
-			}
-			o.getters[name] = getter
+	o.cx.rt.Use(func() {
+		if C.JS_IsArrayObject(o.cx.jscx, o.obj) == C.JS_TRUE {
+			panic("Could't define property on array.")
 		}
 
-		if setter != nil {
-			if o.setters == nil {
-				o.setters = make(map[string]JsPropertySetter)
-			}
-			o.setters[name] = setter
+		cname := C.CString(name)
+		defer C.free(unsafe.Pointer(cname))
+
+		var r C.JSBool
+
+		if getter != nil && setter != nil {
+			r = C.JS_DefineProperty(o.cx.jscx, o.obj, cname, value.val, C.the_go_getter_callback, C.the_go_setter_callback, C.uintN(uint(attrs))|C.JSPROP_SHARED)
+		} else if getter != nil && setter == nil {
+			r = C.JS_DefineProperty(o.cx.jscx, o.obj, cname, value.val, C.the_go_getter_callback, nil, C.uintN(uint(attrs)))
+		} else if getter == nil && setter != nil {
+			r = C.JS_DefineProperty(o.cx.jscx, o.obj, cname, value.val, nil, C.the_go_setter_callback, C.uintN(uint(attrs)))
+		} else {
+			panic("The getter and setter both nil")
 		}
 
-		return true
-	}
+		if r == C.JS_TRUE {
+			if getter != nil {
+				if o.getters == nil {
+					o.getters = make(map[string]JsPropertyGetter)
+				}
+				o.getters[name] = getter
+			}
 
-	return false
+			if setter != nil {
+				if o.setters == nil {
+					o.setters = make(map[string]JsPropertySetter)
+				}
+				o.setters[name] = setter
+			}
+
+			result = true
+		}
+	})
+
+	return result
 }
 
 //export call_go_obj_func
@@ -219,7 +290,8 @@ func call_go_obj_func(op unsafe.Pointer, name *C.char, argc C.uintN, vp *C.jsval
 		argv[i] = newValue(o.cx, C.GET_ARGV(o.cx.jscx, vp, C.int(i)))
 	}
 
-	var result = o.funcs[C.GoString(name)](o, C.GoString(name), argv)
+	var gname = C.GoString(name)
+	var result = o.funcs[gname](o, gname, argv)
 
 	if result != nil {
 		C.SET_RVAL(o.cx.jscx, vp, result.val)
@@ -233,23 +305,26 @@ func call_go_obj_func(op unsafe.Pointer, name *C.char, argc C.uintN, vp *C.jsval
 // @name     The function name
 // @callback The function implement
 func (o *Object) DefineFunction(name string, callback JsObjectFunc) bool {
-	o.cx.rt.lock()
-	defer o.cx.rt.unlock()
+	var result bool
 
-	cname := C.CString(name)
-	defer C.free(unsafe.Pointer(cname))
+	o.cx.rt.Use(func() {
+		cname := C.CString(name)
+		defer C.free(unsafe.Pointer(cname))
 
-	if C.JS_DefineFunction(o.cx.jscx, o.obj, cname, C.the_go_obj_func_callback, 0, 0) == nil {
-		return false
-	}
+		if C.JS_DefineFunction(o.cx.jscx, o.obj, cname, C.the_go_obj_func_callback, 0, 0) == nil {
+			result = false
+		}
 
-	if o.funcs == nil {
-		o.funcs = make(map[string]JsObjectFunc)
-	}
+		if o.funcs == nil {
+			o.funcs = make(map[string]JsObjectFunc)
+		}
 
-	o.funcs[name] = callback
+		o.funcs[name] = callback
 
-	return true
+		result = true
+	})
+
+	return result
 }
 
 /*
