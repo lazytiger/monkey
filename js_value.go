@@ -223,9 +223,7 @@ func (v *Value) ToGo() interface{} {
 
 // Call a function value
 func (v *Value) Call(argv ...*Value) *Value {
-	v.cx.rt.lock()
-	defer v.cx.rt.unlock()
-
+	var result *Value
 	v.cx.rt.Use(func() {
 		argv2 := make([]C.jsval, len(argv))
 		for i := 0; i < len(argv); i++ {
